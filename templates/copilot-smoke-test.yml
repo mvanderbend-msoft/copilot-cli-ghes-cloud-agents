@@ -1,0 +1,30 @@
+# Optional: run this once (Actions > Copilot smoke test > Run workflow) to confirm that the
+# runner can reach the GHES copilot-proxy before you try the agents.
+name: Copilot smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, copilot-agent]
+    timeout-minutes: 10
+    env:
+      COPILOT_OFFLINE: 'true'
+      COPILOT_PROVIDER_GHES_TOKEN: ${{ secrets.COPILOT_AGENT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tools
+        run: |
+          for t in git gh jq node copilot; do printf '%-8s ' "$t"; command -v "$t" || { echo "MISSING"; exit 1; }; done
+          node --version; copilot --version
+      - name: Ask the model
+        run: |
+          export COPILOT_PROVIDER_GHES_HOST="${GITHUB_SERVER_URL#https://}"
+          export COPILOT_HOME="$RUNNER_TEMP/copilot-home"
+          export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+          copilot instruction list || true
+          copilot -p "Reply with exactly: copilot-proxy OK" --no-ask-user --no-auto-update --no-color

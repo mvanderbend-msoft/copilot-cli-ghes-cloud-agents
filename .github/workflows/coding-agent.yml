@@ -1,0 +1,233 @@
+name: Copilot coding agent (GHES)
+
+# Reusable workflow: turns an issue (or an "@copilot" PR comment) into code changes
+# using Copilot CLI on a self-hosted runner. Model traffic goes to the GHES
+# copilot-proxy (COPILOT_OFFLINE), so nothing leaves the enterprise network.
+
+on:
+  workflow_call:
+    inputs:
+      runner-label:
+        description: Label of the self-hosted runner pool that has Copilot CLI installed
+        type: string
+        default: copilot-agent
+      model:
+        description: Optional model override (empty = GHES proxy default)
+        type: string
+        default: ''
+      timeout-minutes:
+        type: number
+        default: 45
+      default-agent:
+        description: Custom agent (.github/agents/<name>.agent.md) used when the trigger doesn't name one (empty = built-in agent)
+        type: string
+        default: ''
+      bot-login:
+        description: Login of the bot user that owns COPILOT_AGENT_TOKEN (its own comments are ignored)
+        type: string
+        default: copilot-agent
+    secrets:
+      COPILOT_AGENT_TOKEN:
+        description: Token of the bot user (scopes repo, workflow, read:org)
+        required: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  code:
+    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    concurrency:
+      group: copilot-coding-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.COPILOT_AGENT_TOKEN }}
+      GH_ENTERPRISE_TOKEN: ${{ secrets.COPILOT_AGENT_TOKEN }}
+      COPILOT_PROVIDER_GHES_TOKEN: ${{ secrets.COPILOT_AGENT_TOKEN }}
+      COPILOT_OFFLINE: 'true'
+      NUMBER: ${{ github.event.issue.number }}
+      IS_PR: ${{ github.event.issue.pull_request && 'true' || 'false' }}
+      COMMENT_ID: ${{ github.event.comment.id }}
+      MODEL: ${{ inputs.model }}
+      TRIGGER_LABEL: ${{ github.event.label.name }}
+      DEFAULT_AGENT: ${{ inputs.default-agent }}
+      BOT_LOGIN: ${{ inputs.bot-login }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Prepare environment
+        run: |
+          host="${GITHUB_SERVER_URL#https://}"
+          {
+            echo "GH_HOST=$host"
+            echo "COPILOT_PROVIDER_GHES_HOST=$host"
+            echo "COPILOT_HOME=$RUNNER_TEMP/copilot-home"
+            echo "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt"
+            echo "WORK=$RUNNER_TEMP/copilot-work"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/copilot-home" "$RUNNER_TEMP/copilot-work"
+          command -v copilot >/dev/null || { echo "::error::Copilot CLI not found on runner"; exit 1; }
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID" -q .body > "$RUNNER_TEMP/copilot-work/comment.md"
+          fi
+
+      - name: Acknowledge
+        run: |
+          gh label create copilot-working --color FBCA04 --description "Copilot agent is working" --force -R "$GITHUB_REPOSITORY" >/dev/null
+          gh issue edit "$NUMBER" -R "$GITHUB_REPOSITORY" --add-label copilot-working >/dev/null
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" -f content=eyes >/dev/null || true
+          fi
+          gh issue comment "$NUMBER" -R "$GITHUB_REPOSITORY" --body "👀 Copilot coding agent picked this up. [Follow the session]($RUN_URL)" >/dev/null
+
+      - name: Resolve branches
+        id: branch
+        run: |
+          if [ "$IS_PR" = "true" ]; then
+            gh pr view "$NUMBER" -R "$GITHUB_REPOSITORY" --json headRefName,baseRefName > "$WORK/pr.json"
+            echo "work=$(jq -r .headRefName "$WORK/pr.json")" >> "$GITHUB_OUTPUT"
+            echo "base=$(jq -r .baseRefName "$WORK/pr.json")" >> "$GITHUB_OUTPUT"
+          else
+            echo "work=copilot/issue-$NUMBER" >> "$GITHUB_OUTPUT"
+            echo "base=$(gh api "repos/$GITHUB_REPOSITORY" -q .default_branch)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.COPILOT_AGENT_TOKEN }}
+          ref: ${{ steps.branch.outputs.base }}
+          fetch-depth: 0
+
+      - name: Switch to work branch
+        env:
+          WORK_BRANCH: ${{ steps.branch.outputs.work }}
+        run: |
+          git config user.name "$BOT_LOGIN"
+          git config user.email "$BOT_LOGIN@users.noreply.$GH_HOST"
+          if git ls-remote --exit-code --heads origin "$WORK_BRANCH" >/dev/null; then
+            git fetch -q origin "$WORK_BRANCH"
+            git checkout -q -B "$WORK_BRANCH" "origin/$WORK_BRANCH"
+          else
+            git checkout -q -b "$WORK_BRANCH"
+          fi
+          git rev-parse HEAD > "$WORK/start-sha"
+
+      - name: Select custom agent
+        id: agent
+        run: |
+          # Label "copilot:<agent>" or PR comment "@copilot agent:<agent> ..." picks a repo custom agent.
+          agent="$DEFAULT_AGENT"
+          case "$TRIGGER_LABEL" in copilot:*) agent="${TRIGGER_LABEL#copilot:}" ;; esac
+          if [ -s "$WORK/comment.md" ]; then
+            from_comment="$(head -1 "$WORK/comment.md" | sed -nE 's/^@copilot[[:space:]]+agent:([A-Za-z0-9._-]+).*/\1/p')"
+            [ -n "$from_comment" ] && agent="$from_comment"
+          fi
+          if [ -n "$agent" ]; then
+            if ! printf '%s' "$agent" | grep -qE '^[A-Za-z0-9._-]+$'; then echo "::error::Invalid agent name"; exit 1; fi
+            available="$(for f in .github/agents/*.md; do [ -f "$f" ] && basename "$f" | sed -E 's/(\.agent)?\.md$//'; done | sort -u | paste -sd, -)"
+            if [ ! -f ".github/agents/$agent.agent.md" ] && [ ! -f ".github/agents/$agent.md" ] \
+               && ! grep -qsE "^name:[[:space:]]*['\"]?$agent['\"]?[[:space:]]*$" .github/agents/*.md; then
+              gh issue comment "$NUMBER" -R "$GITHUB_REPOSITORY" --body "❌ Unknown custom agent \`$agent\`. Available in \`.github/agents\`: ${available:-none}" >/dev/null
+              echo "::error::Unknown custom agent '$agent' (available: ${available:-none})"; exit 1
+            fi
+          fi
+          echo "name=$agent" >> "$GITHUB_OUTPUT"
+          echo "AGENT=$agent" >> "$GITHUB_ENV"
+          echo "### Agent: ${agent:-built-in}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Instruction sources" >> "$GITHUB_STEP_SUMMARY"
+          { echo '```'; copilot instruction list 2>&1 || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build task prompt
+        run: |
+          # Issue/PR text is fetched through the API (not interpolated into the script) to avoid injection.
+          gh api "repos/$GITHUB_REPOSITORY/issues/$NUMBER" > "$WORK/issue.json"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$NUMBER/comments" \
+            -q '.[] | select(.user.login != env.BOT_LOGIN) | "### @\(.user.login)\n\(.body)\n"' > "$WORK/comments.md"
+          {
+            echo "You are an autonomous software engineering agent working in the git repository in the current directory."
+            echo "Complete the task below by editing files in this repository. Follow existing conventions and any repository instructions."
+            echo "Build and run the tests if the project has them. Keep the change focused."
+            echo ""
+            echo "Rules:"
+            echo "- Do NOT run git commit, git push, or gh commands. The workflow commits and opens the pull request for you."
+            echo "- When finished, write a short pull request description in Markdown (what changed and why, how it was verified) to: $WORK/pr-body.md"
+            echo ""
+            if [ "$IS_PR" = "true" ]; then
+              echo "## Context: pull request #$NUMBER — $(jq -r .title "$WORK/issue.json")"
+              jq -r '.body // ""' "$WORK/issue.json"
+              echo ""
+              echo "## New request (from a PR comment) — address this:"
+              sed -E '1s/^@copilot[[:space:]]*(agent:[A-Za-z0-9._-]+[[:space:]]*)?//' "$WORK/comment.md"
+            else
+              echo "## Task: issue #$NUMBER — $(jq -r .title "$WORK/issue.json")"
+              jq -r '.body // "(no description)"' "$WORK/issue.json"
+              if [ -s "$WORK/comments.md" ]; then echo ""; echo "## Discussion"; cat "$WORK/comments.md"; fi
+            fi
+          } > "$WORK/prompt.md"
+          echo "### Prompt" >> "$GITHUB_STEP_SUMMARY"; sed 's/^/    /' "$WORK/prompt.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run Copilot CLI
+        run: |
+          args=(--allow-all-tools --no-ask-user --no-auto-update --no-color
+                --add-dir "$WORK"
+                --deny-tool 'shell(git push)' --deny-tool 'shell(git commit)' --deny-tool 'shell(gh)'
+                --log-dir "$WORK/logs")
+          [ -n "$MODEL" ] && args+=(--model "$MODEL")
+          [ -n "$AGENT" ] && args+=(--agent "$AGENT")
+          set -o pipefail
+          copilot -p "$(cat "$WORK/prompt.md")" "${args[@]}" 2>&1 | tee "$WORK/copilot-output.txt"
+          { echo "### Copilot output"; echo '```'; tail -c 60000 "$WORK/copilot-output.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit, push and open pull request
+        id: pr
+        env:
+          WORK_BRANCH: ${{ steps.branch.outputs.work }}
+          BASE_BRANCH: ${{ steps.branch.outputs.base }}
+        run: |
+          git add -A
+          if git diff --cached --quiet && [ "$(git rev-parse HEAD)" = "$(cat "$WORK/start-sha")" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          title="$(jq -r .title "$WORK/issue.json")"
+          if ! git diff --cached --quiet; then
+            if [ "$IS_PR" = "true" ]; then msg="Copilot: address review feedback on #$NUMBER"; else msg="Copilot: $title"; fi
+            git commit -q -m "$msg" -m "Refs #$NUMBER"
+          fi
+          git push -q -u origin "$WORK_BRANCH"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          if [ "$IS_PR" = "true" ]; then
+            echo "url=$(gh pr view "$NUMBER" -R "$GITHUB_REPOSITORY" --json url -q .url)" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          body="$WORK/body.md"
+          { if [ -s "$WORK/pr-body.md" ]; then cat "$WORK/pr-body.md"; else echo "Automated change for #$NUMBER."; fi
+            echo ""; echo "Closes #$NUMBER"; echo ""
+            echo "_Generated by the Copilot coding agent${AGENT:+ (custom agent \`$AGENT\`)} on GitHub Enterprise Server. [Session log]($RUN_URL)_"; } > "$body"
+          url="$(gh pr list -R "$GITHUB_REPOSITORY" --head "$WORK_BRANCH" --state open --json url -q '.[0].url')"
+          if [ -z "$url" ]; then
+            url="$(gh pr create -R "$GITHUB_REPOSITORY" --base "$BASE_BRANCH" --head "$WORK_BRANCH" --title "[Copilot] $title" --body-file "$body")"
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Report back
+        if: always()
+        env:
+          CHANGED: ${{ steps.pr.outputs.changed }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          if [ "$JOB_STATUS" != "success" ]; then
+            msg="❌ Copilot coding agent failed. [See the session log]($RUN_URL)"
+          elif [ "$CHANGED" = "true" ] && [ "$IS_PR" = "true" ]; then
+            msg="✅ Pushed changes to this pull request. [Session log]($RUN_URL)"
+          elif [ "$CHANGED" = "true" ]; then
+            msg="✅ Opened pull request: $PR_URL"
+          else
+            msg="ℹ️ Copilot finished without making changes. [Session log]($RUN_URL)"
+          fi
+          gh issue comment "$NUMBER" -R "$GITHUB_REPOSITORY" --body "$msg" >/dev/null || true
+          gh issue edit "$NUMBER" -R "$GITHUB_REPOSITORY" --remove-label copilot-working >/dev/null 2>&1 || true
+          if [ -n "$TRIGGER_LABEL" ]; then
+            gh issue edit "$NUMBER" -R "$GITHUB_REPOSITORY" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
+          fi

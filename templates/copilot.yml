@@ -1,0 +1,46 @@
+# Copy this file to .github/workflows/copilot.yml in any repository that should get the agents.
+# Replace YOUR-ORG with the GHES organization that hosts your copy of this repository,
+# and "copilot-agent" with your bot user's login if it differs.
+#
+#   - Label an issue "copilot"             -> coding agent opens a PR
+#   - Label an issue "copilot:<agent>"     -> same, using custom agent .github/agents/<agent>.agent.md
+#   - Comment "@copilot <request>" on a PR -> coding agent pushes follow-up changes
+#     ("@copilot agent:<agent> <request>" picks a custom agent)
+#   - Label a pull request "copilot" or "copilot:<agent>" -> review agent posts a review
+name: Copilot agents
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  coding-agent:
+    if: >-
+      (github.event_name == 'issues' &&
+       (github.event.label.name == 'copilot' || startsWith(github.event.label.name, 'copilot:'))) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '@copilot') &&
+       github.event.comment.user.login != 'copilot-agent' &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    uses: YOUR-ORG/copilot-cli-ghes-cloud-agents/.github/workflows/coding-agent.yml@main
+    with:
+      bot-login: copilot-agent
+    secrets: inherit
+
+  review-agent:
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.label.name == 'copilot' || startsWith(github.event.label.name, 'copilot:'))
+    uses: YOUR-ORG/copilot-cli-ghes-cloud-agents/.github/workflows/review-agent.yml@main
+    with:
+      trigger-label: ${{ github.event.label.name }}
+    secrets: inherit

@@ -1,0 +1,144 @@
+name: Copilot review agent (GHES)
+
+# Reusable workflow: reviews a pull request with Copilot CLI on a self-hosted runner
+# and posts a PR review (summary + inline comments). Model traffic stays on GHES.
+
+on:
+  workflow_call:
+    inputs:
+      runner-label:
+        description: Label of the self-hosted runner pool that has Copilot CLI installed
+        type: string
+        default: copilot-agent
+      model:
+        description: Optional model override (empty = GHES proxy default)
+        type: string
+        default: ''
+      trigger-label:
+        description: Label that triggered the review; removed afterwards so it can be re-applied. "copilot:<agent>" selects a custom agent
+        type: string
+        default: copilot
+      default-agent:
+        description: Custom agent used when the label doesn't name one (empty = built-in agent)
+        type: string
+        default: ''
+    secrets:
+      COPILOT_AGENT_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: [self-hosted, "${{ inputs.runner-label }}"]
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.COPILOT_AGENT_TOKEN }}
+      GH_ENTERPRISE_TOKEN: ${{ secrets.COPILOT_AGENT_TOKEN }}
+      COPILOT_PROVIDER_GHES_TOKEN: ${{ secrets.COPILOT_AGENT_TOKEN }}
+      COPILOT_OFFLINE: 'true'
+      PR: ${{ github.event.pull_request.number }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      MODEL: ${{ inputs.model }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Prepare environment
+        run: |
+          host="${GITHUB_SERVER_URL#https://}"
+          {
+            echo "GH_HOST=$host"
+            echo "COPILOT_PROVIDER_GHES_HOST=$host"
+            echo "COPILOT_HOME=$RUNNER_TEMP/copilot-home"
+            echo "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt"
+            echo "WORK=$RUNNER_TEMP/copilot-work"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/copilot-home" "$RUNNER_TEMP/copilot-work"
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.COPILOT_AGENT_TOKEN }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Collect diff
+        env:
+          TRIGGER_LABEL: ${{ inputs.trigger-label }}
+          DEFAULT_AGENT: ${{ inputs.default-agent }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/reactions" -f content=eyes >/dev/null || true
+          git diff --unified=3 "$BASE_SHA...$HEAD_SHA" > "$WORK/pr.diff"
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" -q '"# " + .title + "\n\n" + (.body // "")' > "$WORK/pr.md"
+          echo "Diff: $(wc -l < "$WORK/pr.diff") lines"
+          agent="$DEFAULT_AGENT"
+          case "$TRIGGER_LABEL" in copilot:*) agent="${TRIGGER_LABEL#copilot:}" ;; esac
+          if [ -n "$agent" ] && ! printf '%s' "$agent" | grep -qE '^[A-Za-z0-9._-]+$'; then echo "::error::Invalid agent name"; exit 1; fi
+          echo "AGENT=$agent" >> "$GITHUB_ENV"
+          echo "### Agent: ${agent:-built-in}" >> "$GITHUB_STEP_SUMMARY"
+          { echo '```'; copilot instruction list 2>&1 || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run Copilot review
+        run: |
+          cat > "$WORK/prompt.md" <<EOF
+          You are a senior code reviewer. Review the pull request described in $WORK/pr.md.
+          The unified diff is in $WORK/pr.diff. The repository (at the PR head) is the current directory; read other files for context when useful.
+          Focus on real problems: bugs, security issues, missing error handling, missing tests, and clear maintainability issues. Do not nitpick style.
+          Do NOT modify any files in the repository.
+          Write your result as JSON to $WORK/review.json with exactly this shape:
+          {"summary": "<markdown overall assessment, 3-8 sentences>",
+           "comments": [{"path": "<file path as in the diff>", "line": <line number in the NEW version of the file, must be an added or context line in the diff>, "body": "<markdown comment, include a suggested fix if possible>"}]}
+          Use an empty comments array if there is nothing worth commenting on.
+          EOF
+          args=(--allow-all-tools --no-ask-user --no-auto-update --no-color --add-dir "$WORK"
+                --deny-tool 'shell(git push)' --deny-tool 'shell(git commit)' --deny-tool 'shell(gh)')
+          [ -n "$MODEL" ] && args+=(--model "$MODEL")
+          [ -n "$AGENT" ] && args+=(--agent "$AGENT")
+          set -o pipefail
+          copilot -p "$(cat "$WORK/prompt.md")" "${args[@]}" 2>&1 | tee "$WORK/copilot-output.txt"
+          { echo "### Copilot output"; echo '```'; tail -c 60000 "$WORK/copilot-output.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post review
+        run: |
+          cat > "$WORK/post.js" <<'EOF'
+          const fs = require('fs');
+          const W = process.env.WORK;
+          let review;
+          try { review = JSON.parse(fs.readFileSync(`${W}/review.json`, 'utf8')); }
+          catch { review = { summary: fs.readFileSync(`${W}/copilot-output.txt`, 'utf8').slice(-6000), comments: [] }; }
+          // Map each file to the set of RIGHT-side line numbers present in the diff.
+          const valid = {}; let file = null, line = 0;
+          for (const l of fs.readFileSync(`${W}/pr.diff`, 'utf8').split('\n')) {
+            if (l.startsWith('+++ ')) { file = l.slice(4).replace(/^b\//, ''); valid[file] = new Set(); continue; }
+            const h = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)/); if (h) { line = +h[1]; continue; }
+            if (!file || l.startsWith('---')) continue;
+            if (l.startsWith('+') || l.startsWith(' ')) { valid[file].add(line); line++; }
+          }
+          const inline = [], loose = [];
+          for (const c of review.comments || []) {
+            (valid[c.path] && valid[c.path].has(+c.line) ? inline : loose).push(c);
+          }
+          let body = `## 🤖 Copilot review (GHES)${process.env.AGENT ? ` — agent \`${process.env.AGENT}\`` : ''}\n\n${review.summary || ''}`;
+          if (loose.length) body += '\n\n### Additional notes\n' + loose.map(c => `- **${c.path}:${c.line}** — ${c.body}`).join('\n');
+          body += `\n\n_Model calls served by the GitHub Enterprise Server copilot-proxy. [Session log](${process.env.RUN_URL})_`;
+          fs.writeFileSync(`${W}/review-payload.json`, JSON.stringify({
+            commit_id: process.env.HEAD_SHA, event: 'COMMENT', body,
+            comments: inline.map(c => ({ path: c.path, line: +c.line, side: 'RIGHT', body: c.body })),
+          }));
+          console.log(`inline comments: ${inline.length}, general notes: ${loose.length}`);
+          EOF
+          node "$WORK/post.js"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --input "$WORK/review-payload.json" -q .html_url
+
+      - name: Clean up
+        if: always()
+        env:
+          TRIGGER_LABEL: ${{ inputs.trigger-label }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          gh pr edit "$PR" -R "$GITHUB_REPOSITORY" --remove-label "$TRIGGER_LABEL" >/dev/null 2>&1 || true
+          if [ "$JOB_STATUS" != "success" ]; then
+            gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body "❌ Copilot review failed. [See the session log]($RUN_URL)" >/dev/null || true
+          fi
